@@ -1,6 +1,7 @@
 import { AttachmentMessageCards, type SessionFileSnapshot } from '@/modules/session-files';
 import MarkdownContext from '@/new-components/common/MarkdownContext';
 import { AttachedConnector } from '@/new-components/connector/types';
+import { decorateInlineCitations } from '@/utils/inline-citations';
 import {
   ApartmentOutlined,
   ApiOutlined,
@@ -149,6 +150,8 @@ export interface ManusLeftPanelProps {
   citationIndexes?: number[];
   /** Open the references panel from the answer footer. */
   onReferencesClick?: () => void;
+  /** Select one source after an inline citation marker is clicked. */
+  onCitationClick?: (index: number) => void;
 }
 
 // Get step icon based on type and status
@@ -1062,8 +1065,34 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
   taskPlan,
   citationIndexes = [],
   onReferencesClick,
+  onCitationClick,
 }) => {
   const { t } = useTranslation();
+  const citationMarkdown = useMemo(
+    () => decorateInlineCitations(assistantText || '', new Set(citationIndexes)),
+    [assistantText, citationIndexes],
+  );
+  const citationComponents = useMemo(
+    () => ({
+      'citation-ref': ({ children, ...props }: React.PropsWithChildren<Record<string, unknown>>) => {
+        const rawIndex = props['data-index'];
+        const index = typeof rawIndex === 'string' || typeof rawIndex === 'number' ? Number(rawIndex) : NaN;
+        if (!Number.isInteger(index) || !citationIndexes.includes(index)) return <>{children}</>;
+        return (
+          <button
+            type='button'
+            aria-label={`查看参考来源 ${index}`}
+            data-citation-index={index}
+            onClick={() => onCitationClick?.(index)}
+            className='mx-0.5 inline-flex cursor-pointer items-center rounded bg-blue-50 px-1 py-0.5 align-baseline text-xs font-semibold text-blue-600 transition-colors hover:bg-blue-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 dark:bg-blue-500/10 dark:text-blue-300 dark:hover:bg-blue-500/20'
+          >
+            {children}
+          </button>
+        );
+      },
+    }),
+    [citationIndexes, onCitationClick],
+  );
   const handleStepClick = useCallback(
     (stepId: string, sectionId: string) => {
       onStepClick?.(stepId, sectionId);
@@ -1237,7 +1266,7 @@ const ManusLeftPanel: React.FC<ManusLeftPanelProps> = ({
               {isAssistantStreaming ? (
                 <span className='whitespace-pre-wrap break-words'>{assistantText}</span>
               ) : (
-                <MarkdownContext>{assistantText}</MarkdownContext>
+                <MarkdownContext components={citationComponents}>{citationMarkdown}</MarkdownContext>
               )}
             </div>
             {citationIndexes.length > 0 && onReferencesClick && (

@@ -6,7 +6,7 @@ import {
   RecallTestProps,
   SearchDocumentParams,
 } from '@/types/knowledge';
-import { GET, POST } from '../index';
+import { GET, GET_BLOB, POST } from '../index';
 
 /**
  * 知识库编辑搜索
@@ -61,6 +61,30 @@ export const recallTest = (data: RecallTestProps, id: string) => {
 export const searchChunk = (data: { document_id: string; content: string }, name: string) => {
   return POST<{ document_id: string; content: string }, string[]>(`/knowledge/${name}/chunk/list`, data);
 };
+
+export interface CitationChunkPreview {
+  spaceId: number;
+  documentId: number;
+  chunkId: number;
+  sourceName: string;
+  sourceType: 'pdf' | 'markdown' | 'text' | 'csv' | 'spreadsheet';
+  content: string;
+  truncated: boolean;
+  pageNumber?: number | null;
+  startLine?: number | null;
+  endLine?: number | null;
+  sheetName?: string | null;
+  startRow?: number | null;
+  endRow?: number | null;
+  mediaType: string;
+  sourceAvailable: boolean;
+}
+
+export const getCitationChunkPreview = (params: { space_id: number; document_id: number; chunk_id: number }) =>
+  GET<typeof params, CitationChunkPreview>('/api/v1/agent/knowledge/citation-preview', params);
+
+export const getCitationOriginalSource = (params: { space_id: number; document_id: number; chunk_id: number }) =>
+  GET_BLOB('/api/v1/agent/knowledge/citation-source', params);
 
 // chunk添加问题
 export const chunkAddQuestion = (data: { chunk_id: string; questions: string[] }) => {

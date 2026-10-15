@@ -2,9 +2,14 @@ import markdownComponents, { markdownPlugins, preprocessLaTeX } from '@/componen
 import { GPTVis } from '@antv/gpt-vis';
 import React from 'react';
 
-const MarkDownContext: React.FC<{ children: string }> = ({ children }) => {
+type MarkdownComponents = Parameters<typeof GPTVis>[0]['components'];
+
+const MarkDownContext: React.FC<{ children: string; components?: Record<string, React.ElementType> }> = ({
+  children,
+  components,
+}) => {
   return (
-    <GPTVis components={{ ...markdownComponents }} {...markdownPlugins}>
+    <GPTVis components={{ ...markdownComponents, ...components } as MarkdownComponents} {...markdownPlugins}>
       {preprocessLaTeX(children)}
     </GPTVis>
   );

@@ -55,6 +55,10 @@ export const GET = <Params = any, Response = any, D = any>(
   return ins.get<Params, ApiResponse<Response>>(url, { params, ...config });
 };
 
+/** Fetch a protected binary resource through the same authenticated client. */
+export const GET_BLOB = <Params = any>(url: string, params?: Params) =>
+  ins.get<Blob>(url, { params, responseType: 'blob' });
+
 export const POST = <Data = any, Response = any, D = any>(url: string, data?: Data, config?: AxiosRequestConfig<D>) => {
   return ins.post<Data, ApiResponse<Response>>(url, data, config);
 };
@@ -84,10 +88,10 @@ export * from './chat';
 export * from './evaluate';
 export * from './flow';
 export * from './knowledge';
+export * from './knowledgeSource';
 export * from './observability';
 export * from './prompt';
 export * from './request';
 export * from './tools';
 export * from './user';
 export * from './wiki';
-export * from './knowledgeSource';

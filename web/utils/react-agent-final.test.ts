@@ -203,6 +203,64 @@ test('normalizes persisted history final_content and structured citations', () =
   });
 });
 
+test('normalizes verified citation locators and rejects invalid locator values', () => {
+  const answer = decodeAgentFinalAnswer({
+    content: 'answer [4]',
+    citations: [
+      {
+        index: 4,
+        id: 'chunk-17',
+        sourceName: 'ByteTrack.pdf',
+        excerpt: 'Persisted fragment',
+        knowledgeSpaceId: 1,
+        documentId: '2',
+        chunkId: 17,
+        sourceType: 'pdf',
+        pageNumber: 3,
+        startLine: -1,
+        endLine: 2.5,
+      },
+    ],
+  });
+
+  assert.deepEqual(answer.citations, [
+    {
+      index: 4,
+      id: 'chunk-17',
+      sourceName: 'ByteTrack.pdf',
+      excerpt: 'Persisted fragment',
+      knowledgeSpaceId: 1,
+      documentId: 2,
+      chunkId: 17,
+      sourceType: 'pdf',
+      pageNumber: 3,
+    },
+  ]);
+});
+
+test('normalizes spreadsheet source locations', () => {
+  const answer = decodeAgentFinalAnswer({
+    content: 'answer [1]',
+    citations: [
+      {
+        index: 1,
+        id: 'chunk-31',
+        sourceName: 'metrics.xlsx',
+        excerpt: 'tracker: 80.3',
+        sourceType: 'spreadsheet',
+        sheetName: 'Results',
+        startRow: 12,
+        endRow: '12',
+      },
+    ],
+  });
+
+  assert.equal(answer.citations[0].sourceType, 'spreadsheet');
+  assert.equal(answer.citations[0].sheetName, 'Results');
+  assert.equal(answer.citations[0].startRow, 12);
+  assert.equal(answer.citations[0].endRow, 12);
+});
+
 test('keeps ordinary JSON answers even when they contain content and citations keys', () => {
   const content = JSON.stringify({
     content: 'This is user-visible JSON, not a history envelope.',

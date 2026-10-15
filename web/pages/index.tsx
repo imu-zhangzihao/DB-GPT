@@ -852,6 +852,7 @@ const Playground: NextPage = () => {
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
   const [rightPanelView, setRightPanelView] = useState<PanelView>('execution');
   const [selectedCitationIndex, setSelectedCitationIndex] = useState<number | null>(null);
+  const [previewCitationIndex, setPreviewCitationIndex] = useState<number | null>(null);
   const [pendingFinalization, setPendingFinalization] = useState<{
     responseId: string;
     summaryText: string;
@@ -3140,6 +3141,18 @@ const Playground: NextPage = () => {
                               }
                             : undefined
                         }
+                        onCitationClick={
+                          roundCitations.length > 0
+                            ? index => {
+                                if (!roundCitations.some(citation => citation.index === index)) return;
+                                if (round.viewMsg?.id) setActiveViewMsgId(round.viewMsg.id);
+                                setSelectedCitationIndex(index);
+                                setPreviewCitationIndex(index);
+                                setRightPanelView('references');
+                                setRightPanelCollapsed(false);
+                              }
+                            : undefined
+                        }
                         modelName={round.viewMsg?.model_name || model}
                         stepThoughts={stepThoughts}
                         artifacts={artifacts.filter(a => a.messageId === round.viewMsg?.id)}
@@ -3950,6 +3963,8 @@ const Playground: NextPage = () => {
                             : null
                         }
                         onCitationSelect={setSelectedCitationIndex}
+                        previewCitationIndex={previewCitationIndex}
+                        onCitationPreviewClose={() => setPreviewCitationIndex(null)}
                         subAgents={parallelSubAgents}
                         onSubAgentClick={agentId => {
                           if (!activeViewMsg?.id) return;

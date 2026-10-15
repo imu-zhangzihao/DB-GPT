@@ -14,6 +14,16 @@ export interface AgentCitation {
   score?: number;
   path?: string;
   url?: string;
+  knowledgeSpaceId?: number;
+  documentId?: number;
+  chunkId?: number;
+  sourceType?: 'pdf' | 'markdown' | 'text' | 'csv' | 'spreadsheet';
+  pageNumber?: number;
+  startLine?: number;
+  endLine?: number;
+  sheetName?: string;
+  startRow?: number;
+  endRow?: number;
 }
 
 export interface AgentFinalAnswer {
@@ -74,6 +84,11 @@ function optionalNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+function optionalPositiveInteger(value: unknown): number | undefined {
+  const parsed = optionalNumber(value);
+  return parsed !== undefined && Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 function normalizeCitation(
   value: unknown,
   fallbackIndex: number,
@@ -97,6 +112,24 @@ function normalizeCitation(
   const score = optionalNumber(value.score ?? value.recall_score);
   const path = optionalString(value.path ?? value.source_path ?? value.file_path, MAX_LOCATION_LENGTH);
   const url = optionalString(value.url ?? value.source_url, MAX_LOCATION_LENGTH);
+  const knowledgeSpaceId = optionalPositiveInteger(value.knowledgeSpaceId ?? value.knowledge_space_id);
+  const documentId = optionalPositiveInteger(value.documentId ?? value.document_id);
+  const chunkId = optionalPositiveInteger(value.chunkId ?? value.chunk_id);
+  const rawSourceType = optionalString(value.sourceType ?? value.source_type, 32);
+  const sourceType =
+    rawSourceType === 'pdf' ||
+    rawSourceType === 'markdown' ||
+    rawSourceType === 'text' ||
+    rawSourceType === 'csv' ||
+    rawSourceType === 'spreadsheet'
+      ? rawSourceType
+      : undefined;
+  const pageNumber = optionalPositiveInteger(value.pageNumber ?? value.page_number);
+  const startLine = optionalPositiveInteger(value.startLine ?? value.start_line);
+  const endLine = optionalPositiveInteger(value.endLine ?? value.end_line);
+  const sheetName = optionalString(value.sheetName ?? value.sheet_name, 256);
+  const startRow = optionalPositiveInteger(value.startRow ?? value.start_row ?? value.row);
+  const endRow = optionalPositiveInteger(value.endRow ?? value.end_row ?? value.row);
 
   return {
     index,
@@ -106,6 +139,16 @@ function normalizeCitation(
     ...(score !== undefined && { score }),
     ...(path && { path }),
     ...(url && { url }),
+    ...(knowledgeSpaceId !== undefined && { knowledgeSpaceId }),
+    ...(documentId !== undefined && { documentId }),
+    ...(chunkId !== undefined && { chunkId }),
+    ...(sourceType && { sourceType }),
+    ...(pageNumber !== undefined && { pageNumber }),
+    ...(startLine !== undefined && { startLine }),
+    ...(endLine !== undefined && { endLine }),
+    ...(sheetName && { sheetName }),
+    ...(startRow !== undefined && { startRow }),
+    ...(endRow !== undefined && { endRow }),
   };
 }
 

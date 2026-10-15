@@ -1,9 +1,11 @@
+import { getCitationChunkPreview, type CitationChunkPreview } from '@/client/api/knowledge';
 import { CodePreview } from '@/components/chat/chat-content/code-preview';
 import markdownComponents, { markdownPlugins, preprocessLaTeX } from '@/components/chat/chat-content/config';
 import type { SessionFileSnapshot } from '@/modules/session-files';
 import AdvancedChart, { createChartConfig } from '@/new-components/charts';
 import MarkDownContext from '@/new-components/common/MarkdownContext';
 import type { SubAgentState, SubAgentStep } from '@/types/subagent';
+import { getCitationSourceKind, getSafeCitationUrl } from '@/utils/citation-preview';
 import type { AgentCitation } from '@/utils/react-agent-final';
 import {
   ApartmentOutlined,
@@ -45,11 +47,12 @@ import {
   UpOutlined,
 } from '@ant-design/icons';
 import { GPTVis } from '@antv/gpt-vis';
-import { Button, Table, Tooltip, message } from 'antd';
+import { Alert, Button, Modal, Spin, Table, Tooltip, message } from 'antd';
 import classNames from 'classnames';
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Collapsible } from '../tools/Collapsible';
+import { CitationOriginalViewer } from './CitationOriginalViewer';
 import ConversationTracePanel from './ConversationTracePanel';
 import { ArtifactItem, StepStatus, StepType } from './ManusLeftPanel';
 import ParallelTasksPanel from './ParallelTasksPanel';
@@ -207,6 +210,10 @@ export interface ManusRightPanelProps {
   selectedCitationIndex?: number | null;
   /** Keep selection in sync when a reference card is clicked. */
   onCitationSelect?: (index: number) => void;
+  /** Citation requested from an inline answer marker. */
+  previewCitationIndex?: number | null;
+  /** Close/reset an inline-triggered citation preview. */
+  onCitationPreviewClose?: () => void;
   /** Structured rows for the active dispatch_parallel_tasks step. */
   subAgents?: Record<string, SubAgentState>;
   /** Drill into one structured sub-agent from the parallel overview. */
@@ -2357,16 +2364,6 @@ const SkillCardRenderer: React.FC<{
 
 SkillCardRenderer.displayName = 'SkillCardRenderer';
 
-const getSafeReferenceUrl = (url?: string): string | null => {
-  if (!url) return null;
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : null;
-  } catch {
-    return null;
-  }
-};
-
 const formatReferenceScore = (score?: number | null): string | null => {
   if (typeof score !== 'number' || !Number.isFinite(score)) return null;
   if (score >= 0 && score <= 1) return `${(score * 100).toFixed(1)}%`;
@@ -2377,13 +2374,41 @@ const ReferencesPanel: React.FC<{
   citations: AgentCitation[];
   selectedCitationIndex?: number | null;
   onCitationSelect?: (index: number) => void;
-}> = ({ citations, selectedCitationIndex, onCitationSelect }) => {
+  previewCitationIndex?: number | null;
+  onCitationPreviewClose?: () => void;
+}> = ({ citations, selectedCitationIndex, onCitationSelect, previewCitationIndex, onCitationPreviewClose }) => {
   const itemRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const [previewCitation, setPreviewCitation] = useState<AgentCitation | null>(null);
+
+  useEffect(() => {
+    if (!previewCitation) return;
+    const remainsAvailable = citations.some(
+      citation => citation.index === previewCitation.index && citation.id === previewCitation.id,
+    );
+    if (!remainsAvailable) setPreviewCitation(null);
+  }, [citations, previewCitation]);
 
   useEffect(() => {
     if (selectedCitationIndex == null) return;
     itemRefs.current.get(selectedCitationIndex)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }, [selectedCitationIndex]);
+
+  useEffect(() => {
+    if (previewCitationIndex == null) return;
+    const citation = citations.find(item => item.index === previewCitationIndex);
+    if (citation) {
+      setPreviewCitation(citation);
+      // Consume the page-level request once. The modal remains controlled by
+      // local citation identity and will not reopen when another answer with
+      // the same numeric index becomes active.
+      onCitationPreviewClose?.();
+    }
+  }, [citations, onCitationPreviewClose, previewCitationIndex]);
+
+  const closePreview = () => {
+    setPreviewCitation(null);
+    onCitationPreviewClose?.();
+  };
 
   return (
     <div className='space-y-3' data-testid='references-panel'>
@@ -2393,7 +2418,7 @@ const ReferencesPanel: React.FC<{
       {citations.map(citation => {
         const isSelected = citation.index === selectedCitationIndex;
         const score = formatReferenceScore(citation.score);
-        const safeUrl = getSafeReferenceUrl(citation.url);
+        const safeUrl = getSafeCitationUrl(citation.url);
         return (
           <div
             key={`${citation.id}-${citation.index}`}
@@ -2419,9 +2444,18 @@ const ReferencesPanel: React.FC<{
             data-reference-index={citation.index}
           >
             <div className='flex items-start gap-3'>
-              <span className='inline-flex h-6 min-w-6 flex-shrink-0 items-center justify-center rounded-md bg-blue-500 px-1.5 text-xs font-semibold text-white'>
+              <button
+                type='button'
+                aria-label={`预览引用 ${citation.index}：${citation.sourceName || citation.path || '知识来源'}`}
+                onClick={event => {
+                  event.stopPropagation();
+                  onCitationSelect?.(citation.index);
+                  setPreviewCitation(citation);
+                }}
+                className='inline-flex h-6 min-w-6 flex-shrink-0 items-center justify-center rounded-md bg-blue-500 px-1.5 text-xs font-semibold text-white transition-colors hover:bg-blue-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40'
+              >
                 {citation.index}
-              </span>
+              </button>
               <div className='min-w-0 flex-1'>
                 <div className='flex flex-wrap items-center justify-between gap-2'>
                   <span className='min-w-0 break-words text-sm font-semibold text-gray-900 dark:text-gray-100'>
@@ -2443,24 +2477,189 @@ const ReferencesPanel: React.FC<{
                     {citation.excerpt}
                   </div>
                 )}
-                {safeUrl && (
-                  <a
-                    href={safeUrl}
-                    target='_blank'
-                    rel='noreferrer noopener'
-                    onClick={event => event.stopPropagation()}
-                    className='mt-3 inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300'
+                <div className='mt-3 flex flex-wrap items-center gap-3'>
+                  <button
+                    type='button'
+                    onClick={event => {
+                      event.stopPropagation();
+                      onCitationSelect?.(citation.index);
+                      setPreviewCitation(citation);
+                    }}
+                    className='inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 dark:text-blue-400 dark:hover:text-blue-300'
                   >
-                    <LinkOutlined aria-hidden />
-                    打开来源
-                  </a>
-                )}
+                    <EyeOutlined aria-hidden />
+                    预览原文
+                  </button>
+                  {safeUrl && (
+                    <a
+                      href={safeUrl}
+                      target='_blank'
+                      rel='noreferrer noopener'
+                      onClick={event => event.stopPropagation()}
+                      className='inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300'
+                    >
+                      <LinkOutlined aria-hidden />
+                      打开来源
+                    </a>
+                  )}
+                </div>
               </div>
             </div>
           </div>
         );
       })}
+      <CitationPreviewModal citation={previewCitation} onClose={closePreview} />
     </div>
+  );
+};
+
+const CitationPreviewModal: React.FC<{
+  citation: AgentCitation | null;
+  onClose: () => void;
+}> = ({ citation, onClose }) => {
+  const [preview, setPreview] = useState<CitationChunkPreview | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<'unavailable' | 'forbidden' | null>(null);
+  const [originalBlob, setOriginalBlob] = useState<Blob | null>(null);
+
+  const hasLocator = Boolean(citation?.knowledgeSpaceId && citation.documentId && citation.chunkId);
+
+  useEffect(() => {
+    let active = true;
+    setPreview(null);
+    setOriginalBlob(null);
+    setLoadError(null);
+    if (!citation || !citation.knowledgeSpaceId || !citation.documentId || !citation.chunkId) {
+      setLoading(false);
+      return () => {
+        active = false;
+      };
+    }
+    setLoading(true);
+    getCitationChunkPreview({
+      space_id: citation.knowledgeSpaceId,
+      document_id: citation.documentId,
+      chunk_id: citation.chunkId,
+    })
+      .then(response => {
+        if (!active) return;
+        if (response.data.success && response.data.data) setPreview(response.data.data);
+        else setLoadError('unavailable');
+      })
+      .catch(error => {
+        if (!active) return;
+        setLoadError(error?.response?.status === 403 ? 'forbidden' : 'unavailable');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [citation]);
+
+  if (!citation) return null;
+
+  const sourceKind =
+    preview?.sourceType || citation.sourceType || getCitationSourceKind(citation.sourceName, citation.path);
+  const sourceKindLabel =
+    sourceKind === 'pdf'
+      ? 'PDF 原文件'
+      : sourceKind === 'markdown'
+        ? 'Markdown 原文件'
+        : sourceKind === 'spreadsheet'
+          ? 'Excel 原文件'
+          : sourceKind === 'csv'
+            ? 'CSV 原文件'
+            : '原文件';
+  const score = formatReferenceScore(citation.score);
+  const safeUrl = getSafeCitationUrl(citation.url);
+  const visibleContent = preview?.content || citation.excerpt || '';
+
+  return (
+    <Modal
+      open
+      width={1100}
+      title={`引用 [${citation.index}] · ${citation.sourceName || citation.path || '知识来源'}`}
+      onCancel={onClose}
+      footer={null}
+      destroyOnClose
+      focusTriggerAfterClose
+    >
+      <div data-testid='citation-preview-modal'>
+        <div className='mb-4 flex flex-wrap items-center gap-2 text-xs text-gray-500 dark:text-gray-400'>
+          <span className='rounded-full bg-blue-50 px-2 py-1 font-medium text-blue-700 dark:bg-blue-500/10 dark:text-blue-300'>
+            {sourceKindLabel}
+          </span>
+          {score && <span>相关度 {score}</span>}
+          {citation.path && <span className='break-all font-mono'>{citation.path}</span>}
+          {(preview?.pageNumber || citation.pageNumber) && (
+            <span>第 {preview?.pageNumber || citation.pageNumber} 页</span>
+          )}
+        </div>
+        {loading ? (
+          <div className='flex min-h-40 items-center justify-center'>
+            <Spin tip='正在加载原文片段…' />
+          </div>
+        ) : (
+          <>
+            {preview?.sourceAvailable ? (
+              <CitationOriginalViewer citation={citation} preview={preview} onBlobReady={setOriginalBlob} />
+            ) : (
+              <>
+                <Alert
+                  className='mb-3'
+                  type={loadError ? 'warning' : 'info'}
+                  showIcon
+                  message={
+                    hasLocator
+                      ? loadError === 'forbidden'
+                        ? '无权访问该原文件'
+                        : '引用快照（原文件当前不可用）'
+                      : '引用快照（历史引用没有原文定位信息）'
+                  }
+                />
+                <div className='max-h-[55vh] overflow-y-auto rounded-lg border border-gray-200 bg-gray-50 p-4 dark:border-gray-700 dark:bg-[#111217]'>
+                  <pre className='m-0 whitespace-pre-wrap break-words font-sans text-sm leading-6 text-gray-800 dark:text-gray-200'>
+                    {visibleContent || '该引用没有可预览的原文片段。'}
+                  </pre>
+                </div>
+              </>
+            )}
+          </>
+        )}
+        <div className='mt-4 flex flex-wrap items-center justify-end gap-2'>
+          {visibleContent && (
+            <Button icon={<CopyOutlined />} onClick={() => copyToClipboard(visibleContent, '原文片段已复制')}>
+              复制原文
+            </Button>
+          )}
+          {originalBlob && (
+            <Button
+              icon={<DownloadOutlined />}
+              onClick={() => {
+                const url = URL.createObjectURL(originalBlob);
+                const anchor = document.createElement('a');
+                anchor.href = url;
+                anchor.download = preview?.sourceName || citation.sourceName || 'source';
+                anchor.click();
+                URL.revokeObjectURL(url);
+              }}
+            >
+              下载原文件
+            </Button>
+          )}
+          {safeUrl && (
+            <Button href={safeUrl} target='_blank' rel='noreferrer noopener' icon={<LinkOutlined />}>
+              打开来源
+            </Button>
+          )}
+          <Button type='primary' onClick={onClose}>
+            关闭
+          </Button>
+        </div>
+      </div>
+    </Modal>
   );
 };
 
@@ -2487,6 +2686,8 @@ const ManusRightPanel: React.FC<ManusRightPanelProps> = ({
   citations = [],
   selectedCitationIndex,
   onCitationSelect,
+  previewCitationIndex,
+  onCitationPreviewClose,
   subAgents,
   onSubAgentClick,
   subAgentContext,
@@ -2878,6 +3079,8 @@ const ManusRightPanel: React.FC<ManusRightPanelProps> = ({
             citations={citations}
             selectedCitationIndex={selectedCitationIndex}
             onCitationSelect={onCitationSelect}
+            previewCitationIndex={previewCitationIndex}
+            onCitationPreviewClose={onCitationPreviewClose}
           />
         ) : panelView === 'skill-preview' && skillName ? (
           <div className='w-full h-full flex flex-col p-5 overflow-auto'>
