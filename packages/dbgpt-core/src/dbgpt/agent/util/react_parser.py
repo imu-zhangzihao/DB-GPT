@@ -1,3 +1,4 @@
+import html
 import json
 import re
 from dataclasses import dataclass
@@ -27,6 +28,34 @@ _NATIVE_TOOL_CALL_PATTERN = re.compile(
     r"<\|tool_call_end\|>",
     re.DOTALL,
 )
+
+# CMECloud/DeepSeek-compatible gateways may serialize tool calls as DSML text
+# instead of returning OpenAI ``tool_calls``. The delimiter is often the
+# full-width vertical bar (``｜``), for example:
+# ``<｜DSML｜invoke name="kb_ls">...</｜DSML｜invoke>``.
+_DSML_INVOKE_PATTERN = re.compile(
+    r"<[|｜]DSML[|｜]invoke\b(?P<attrs>[^>]*)>"
+    r"(?P<body>.*?)"
+    r"</[|｜]DSML[|｜]invoke\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_DSML_PARAMETER_PATTERN = re.compile(
+    r"<[|｜]DSML[|｜]parameter\b(?P<attrs>[^>]*)>"
+    r"(?P<value>.*?)"
+    r"</[|｜]DSML[|｜]parameter\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_DSML_NAME_ATTRIBUTE_PATTERN = re.compile(
+    r"\bname\s*=\s*(['\"])(?P<name>[\w.\-]+)\1", re.IGNORECASE
+)
+_DSML_STRING_ATTRIBUTE_PATTERN = re.compile(
+    r"\bstring\s*=\s*(['\"])(?P<value>true|false)\1", re.IGNORECASE
+)
+_DSML_WRAPPER_PATTERN = re.compile(
+    r"</?[|｜]DSML[|｜](?:tool_calls|tool_call)\b[^>]*>", re.IGNORECASE
+)
+_MAX_DSML_PARAMETERS = 64
+_MAX_DSML_PARAMETER_CHARS = 100_000
 
 
 @dataclass
@@ -186,12 +215,62 @@ class ReActOutputParser:
 
         return _NATIVE_TOOL_CALL_PATTERN.sub(_render, text)
 
+    def _translate_dsml_tool_calls(self, text: str) -> str:
+        """Translate leaked DSML tool calls into the textual ReAct contract.
+
+        This intentionally uses bounded pattern matching instead of an XML
+        parser: model output is untrusted and must not gain entity/file access.
+        Malformed or ambiguous invocations are left untouched and therefore
+        fail closed in the normal ReAct parser.
+        """
+        if not re.search(r"<[|｜]DSML[|｜]invoke\b", text, re.IGNORECASE):
+            return text
+
+        def _render(match: "re.Match[str]") -> str:
+            name_match = _DSML_NAME_ATTRIBUTE_PATTERN.search(match.group("attrs"))
+            if not name_match:
+                return match.group(0)
+            tool = name_match.group("name")
+            arguments = {}
+            parameters = list(_DSML_PARAMETER_PATTERN.finditer(match.group("body")))
+            if len(parameters) > _MAX_DSML_PARAMETERS:
+                return match.group(0)
+            for parameter in parameters:
+                parameter_name_match = _DSML_NAME_ATTRIBUTE_PATTERN.search(
+                    parameter.group("attrs")
+                )
+                if not parameter_name_match:
+                    return match.group(0)
+                parameter_name = parameter_name_match.group("name")
+                if parameter_name in arguments:
+                    return match.group(0)
+                raw_value = html.unescape(parameter.group("value").strip())
+                if len(raw_value) > _MAX_DSML_PARAMETER_CHARS:
+                    return match.group(0)
+                string_match = _DSML_STRING_ATTRIBUTE_PATTERN.search(
+                    parameter.group("attrs")
+                )
+                if string_match and string_match.group("value").lower() == "true":
+                    value: Any = raw_value
+                else:
+                    try:
+                        value = json.loads(raw_value)
+                    except (json.JSONDecodeError, TypeError):
+                        value = raw_value
+                arguments[parameter_name] = value
+            encoded = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+            return f"\nAction: {tool}\nAction Input: {encoded}\n"
+
+        translated = _DSML_INVOKE_PATTERN.sub(_render, text)
+        return _DSML_WRAPPER_PATTERN.sub("", translated)
+
     def _normalize_react_text(self, text: str) -> str:
         """Normalize common wrappers before ReAct parsing."""
         if not text:
             return text
 
         text = self._translate_native_tool_calls(text)
+        text = self._translate_dsml_tool_calls(text)
         text = _SPECIAL_TOKEN_PATTERN.sub("", text)
         text = self._strip_vis_thinking_blocks(text)
         text = self._strip_markdown_code_fence(text)

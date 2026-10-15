@@ -595,6 +595,65 @@ Action Input: {"demo": true}
         assert steps[0].is_terminal
         assert parser.get_final_output(steps) == "最终答案"
 
+    def test_cmecloud_dsml_tool_call_is_translated(self):
+        """CMECloud may leak full-width DSML markup as assistant text."""
+        parser = ReActOutputParser()
+        text = (
+            "Thought: 查看论文原文。\n\n"
+            '<｜DSML｜tool_calls><｜DSML｜invoke name="kb_cat">'
+            '<｜DSML｜parameter name="path" string="true">'
+            "ByteTrack.pdf</｜DSML｜parameter>"
+            '<｜DSML｜parameter name="start_line" string="true">'
+            "1</｜DSML｜parameter>"
+            '<｜DSML｜parameter name="end_line" string="true">'
+            "0</｜DSML｜parameter>"
+            "</｜DSML｜invoke></｜DSML｜tool_calls>"
+        )
+
+        steps = parser.parse_current_step(text)
+
+        assert len(steps) == 1
+        assert steps[0].thought == "查看论文原文。"
+        assert steps[0].action == "kb_cat"
+        assert steps[0].action_input == {
+            "path": "ByteTrack.pdf",
+            "start_line": "1",
+            "end_line": "0",
+        }
+
+    def test_cmecloud_dsml_empty_and_typed_parameters(self):
+        parser = ReActOutputParser()
+        empty_call = (
+            '<|DSML|tool_calls><|DSML|invoke name="kb_ls">\n'
+            "</|DSML|invoke></|DSML|tool_calls>"
+        )
+        typed_call = (
+            '<｜DSML｜invoke name="semantic_search">'
+            '<｜DSML｜parameter name="top_k" string="false">5'
+            "</｜DSML｜parameter>"
+            '<｜DSML｜parameter name="query" string="true">A &amp; B'
+            "</｜DSML｜parameter>"
+            "</｜DSML｜invoke>"
+        )
+
+        assert parser.parse_current_step(empty_call)[0].action_input == {}
+        typed_step = parser.parse_current_step(typed_call)[0]
+        assert typed_step.action == "semantic_search"
+        assert typed_step.action_input == {"top_k": 5, "query": "A & B"}
+
+    def test_malformed_dsml_fails_closed(self):
+        parser = ReActOutputParser()
+        duplicate_parameters = (
+            '<｜DSML｜invoke name="kb_cat">'
+            '<｜DSML｜parameter name="path" string="true">a.pdf'
+            "</｜DSML｜parameter>"
+            '<｜DSML｜parameter name="path" string="true">b.pdf'
+            "</｜DSML｜parameter>"
+            "</｜DSML｜invoke>"
+        )
+
+        assert parser.parse_current_step(duplicate_parameters) == []
+
     def test_plain_answer_without_labels_is_still_rejected(self):
         """A bare answer (no ReAct labels, no native call) stays unparseable
         so the agent keeps its format-error retry semantics."""
