@@ -270,6 +270,118 @@ def test_explicit_retrieval_citations_keep_sparse_chunk_numbers() -> None:
     ]
 
 
+def test_semantic_search_preserves_verified_locator_and_global_index() -> None:
+    assembler = FinalAnswerAssembler()
+    assembler.observe(
+        "semantic_search",
+        {"query": "tracking"},
+        json.dumps(
+            {
+                "chunks": [{"output_type": "markdown", "content": "### Result 4 [ByteTrack.pdf]\nExact text"}],
+                "citations": [
+                    {
+                        "index": 4,
+                        "id": "chunk-17",
+                        "sourceName": "ByteTrack.pdf",
+                        "excerpt": "Exact persisted PDF fragment.",
+                        "score": 0.88,
+                        "knowledgeSpaceId": 1,
+                        "documentId": 2,
+                        "chunkId": 17,
+                        "sourceType": "pdf",
+                        "pageNumber": 3,
+                    }
+                ],
+            }
+        ),
+    )
+
+    assert assembler.finalize("Supported claim [4].").to_dict()["citations"] == [
+        {
+            "index": 4,
+            "id": "chunk-17",
+            "sourceName": "ByteTrack.pdf",
+            "excerpt": "Exact persisted PDF fragment.",
+            "score": 0.88,
+            "path": None,
+            "url": None,
+            "knowledgeSpaceId": 1,
+            "documentId": 2,
+            "chunkId": 17,
+            "sourceType": "pdf",
+            "pageNumber": 3,
+        }
+    ]
+
+
+def test_semantic_search_preserves_spreadsheet_locator() -> None:
+    assembler = FinalAnswerAssembler()
+    assembler.observe(
+        "semantic_search",
+        {"query": "score"},
+        json.dumps(
+            {
+                "citations": [
+                    {
+                        "index": 2,
+                        "id": "chunk-31",
+                        "sourceName": "metrics.xlsx",
+                        "excerpt": "tracker: 80.3",
+                        "knowledgeSpaceId": 1,
+                        "documentId": 3,
+                        "chunkId": 31,
+                        "sourceType": "spreadsheet",
+                        "sheetName": "Results",
+                        "startRow": 12,
+                        "endRow": 12,
+                    }
+                ]
+            }
+        ),
+    )
+
+    citation = assembler.finalize("Score [2].").to_dict()["citations"][0]
+    assert citation["sourceType"] == "spreadsheet"
+    assert citation["sheetName"] == "Results"
+    assert citation["startRow"] == 12
+    assert citation["endRow"] == 12
+
+
+@pytest.mark.parametrize("tool_name", ["kb_cat", "kb_grep"])
+def test_file_tools_preserve_structured_pdf_locator(tool_name: str) -> None:
+    assembler = FinalAnswerAssembler()
+    assembler.observe(
+        tool_name,
+        {"path": "ByteTrack.pdf", "query": "association"},
+        json.dumps(
+            {
+                "content": "ByteTrack evidence",
+                "citations": [
+                    {
+                        "index": 3,
+                        "id": "chunk-75",
+                        "sourceName": "ByteTrack.pdf",
+                        "excerpt": "Associating low score detections recovers objects.",
+                        "knowledgeSpaceId": 1,
+                        "documentId": 1,
+                        "chunkId": 75,
+                        "sourceType": "pdf",
+                        "pageNumber": 3,
+                    }
+                ],
+            }
+        ),
+    )
+
+    citation = assembler.finalize("Supported claim [3].").to_dict()["citations"][0]
+
+    assert citation["index"] == 3
+    assert citation["knowledgeSpaceId"] == 1
+    assert citation["documentId"] == 1
+    assert citation["chunkId"] == 75
+    assert citation["pageNumber"] == 3
+
+
 def test_non_finite_scores_are_not_serialized_into_sse_json() -> None:
     assembler = FinalAnswerAssembler()
     assembler.observe(

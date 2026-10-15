@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -11,6 +12,7 @@ import zipfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
@@ -32,7 +34,9 @@ from dbgpt.agent.resource.tool.base import tool
 from dbgpt.agent.skill.manage import get_skill_manager
 from dbgpt.component import ComponentType
 from dbgpt.configs.model_config import SKILLS_DIR, resolve_root_path
+from dbgpt.configs.model_config import KNOWLEDGE_CACHE_ROOT_PATH
 from dbgpt.core import PromptTemplate
+from dbgpt.core.interface.file import FileStorageClient
 from dbgpt.model.cluster import WorkerManagerFactory
 from dbgpt.util.json_utils import parse_or_raise_error
 from dbgpt_app.openapi.api_view_model import (
@@ -75,6 +79,182 @@ DEFAULT_SKILLS_DIR = SKILLS_DIR
 AUTO_DATA_MARKER_PATTERN = re.compile(
     r"###([A-Z0-9_]+)_START###\s*(.*?)\s*###\1_END###", re.DOTALL
 )
+_KNOWLEDGE_CONTEXT_PREFIX_PATTERN = re.compile(
+    r"^\[文件: [^\]]*\](?:\s*\[路径: [^\]]*\])?\s*\n?"
+)
+MAX_CITATION_PREVIEW_CHARS = 20_000
+REACT_AGENT_TIMEOUT_SECONDS = 600
+
+
+def _citation_access_source(
+    space_id: int,
+    document_id: int,
+    chunk_id: int,
+    user_token: UserRequest,
+):
+    """Resolve and authorize a citation without leaking foreign identities."""
+    from dbgpt_serve.rag.models.models import KnowledgeSpaceDao
+    from dbgpt_serve.rag.tools.citation_source import get_citation_source
+
+    spaces = KnowledgeSpaceDao().get_knowledge_space_by_ids([space_id])
+    if len(spaces) != 1:
+        raise HTTPException(status_code=404, detail="Citation source not found")
+    space = spaces[0]
+    user_id = (user_token.user_id or "").strip()
+    if space.owner and space.owner != user_id:
+        raise HTTPException(status_code=404, detail="Citation source not found")
+    source = get_citation_source(space_id, document_id, chunk_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Citation source not found")
+    return source
+
+
+def _citation_original_files(source) -> List[str]:
+    """Return trusted original-file candidates for a verified citation.
+
+    Older knowledge documents can retain a ``dbgpt-fs://`` reference whose file
+    metadata is no longer available while their imported source is still present
+    in the knowledge cache.  Keep both references so the download endpoint can
+    fall back to that cache copy instead of incorrectly reporting a 404.
+    """
+    from dbgpt_serve.rag.models.chunk_db import DocumentChunkDao, DocumentChunkEntity
+    from dbgpt_serve.rag.models.document_db import KnowledgeDocumentDao
+    from dbgpt_serve.rag.tools.citation_source import _metadata_dict
+
+    document = KnowledgeDocumentDao().document_by_id(source.document_id)
+    if document is None:
+        return []
+    candidates: List[str] = []
+    content = (document.content or "").strip()
+    if content.startswith("dbgpt-fs://"):
+        candidates.append(content)
+
+    chunks = DocumentChunkDao().get_document_chunks(
+        DocumentChunkEntity(id=source.chunk_id), page=1, page_size=2
+    )
+    if len(chunks) != 1:
+        return candidates
+    candidate = str(_metadata_dict(chunks[0].meta_info).get("source") or "").strip()
+    if not candidate:
+        return candidates
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=True)
+        cache_root = Path(KNOWLEDGE_CACHE_ROOT_PATH).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return candidates
+    if resolved.is_relative_to(cache_root) and resolved.is_file():
+        local_candidate = str(resolved)
+        if local_candidate not in candidates:
+            # The cache copy has already passed strict existence and root
+            # containment checks. Prefer it over a stale remote URI, whose
+            # backend lookup may block before a fallback can be attempted.
+            candidates.insert(0, local_candidate)
+    return candidates
+
+
+def _citation_media_type(source_name: str) -> str:
+    guessed, _ = mimetypes.guess_type(source_name)
+    return guessed or "application/octet-stream"
+
+
+def _load_citation_chunk_preview(
+    space_id: int,
+    document_id: int,
+    chunk_id: int,
+    user_token: UserRequest,
+) -> Dict[str, Any]:
+    """Return one verified knowledge chunk without exposing storage paths."""
+    source = _citation_access_source(space_id, document_id, chunk_id, user_token)
+    content = _KNOWLEDGE_CONTEXT_PREFIX_PATTERN.sub("", source.content).strip()
+    truncated = len(content) > MAX_CITATION_PREVIEW_CHARS
+    return {
+        "spaceId": source.space_id,
+        "documentId": source.document_id,
+        "chunkId": source.chunk_id,
+        "sourceName": source.source_name,
+        "sourceType": source.source_type,
+        "content": content[:MAX_CITATION_PREVIEW_CHARS],
+        "truncated": truncated,
+        "pageNumber": source.page_number,
+        "startLine": source.start_line,
+        "endLine": source.end_line,
+        "sheetName": source.sheet_name,
+        "startRow": source.start_row,
+        "endRow": source.end_row,
+        "mediaType": _citation_media_type(source.source_name),
+        "sourceAvailable": bool(_citation_original_files(source)),
+    }
+
+
+@router.get("/v1/agent/knowledge/citation-preview", response_model=Result)
+async def citation_chunk_preview(
+    space_id: int = Query(..., gt=0),
+    document_id: int = Query(..., gt=0),
+    chunk_id: int = Query(..., gt=0),
+    user_token: UserRequest = Depends(get_user_from_headers),
+):
+    """Load the persisted fragment identified by a structured citation."""
+    return Result.succ(
+        _load_citation_chunk_preview(
+            space_id=space_id,
+            document_id=document_id,
+            chunk_id=chunk_id,
+            user_token=user_token,
+        )
+    )
+
+
+@router.get("/v1/agent/knowledge/citation-source")
+async def citation_original_source(
+    space_id: int = Query(..., gt=0),
+    document_id: int = Query(..., gt=0),
+    chunk_id: int = Query(..., gt=0),
+    user_token: UserRequest = Depends(get_user_from_headers),
+):
+    """Stream the original document owned by a verified citation."""
+    source = _citation_access_source(space_id, document_id, chunk_id, user_token)
+    file_references = _citation_original_files(source)
+    if not file_references:
+        raise HTTPException(status_code=404, detail="Original source not found")
+
+    storage_client = FileStorageClient.get_instance(CFG.SYSTEM_APP)
+    stream = None
+    metadata = None
+    for file_reference in file_references:
+        try:
+            stream, metadata = storage_client.get_file(file_reference)
+            break
+        except (FileNotFoundError, ValueError, OSError):
+            logger.debug(
+                "Citation source candidate is unavailable (scheme=%s)",
+                urlparse(file_reference).scheme or "local-cache",
+                exc_info=True,
+            )
+    if stream is None:
+        raise HTTPException(status_code=404, detail="Original source not found")
+
+    def body_iterator():
+        try:
+            while True:
+                block = stream.read(64 * 1024)
+                if not block:
+                    break
+                yield block
+        finally:
+            stream.close()
+
+    media_type = _citation_media_type(source.source_name)
+    headers = {
+        "Content-Disposition": (
+            "inline; filename*=UTF-8''" + quote(source.source_name, safe="")
+        ),
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    file_hash = getattr(metadata, "file_hash", None)
+    if file_hash:
+        headers["ETag"] = f'"{file_hash}"'
+    return StreamingResponse(body_iterator(), media_type=media_type, headers=headers)
 
 
 def _validate_upload_filename(filename: str) -> str:
@@ -2667,7 +2847,8 @@ Action Input: The JSON format of tool parameters
 
 IMPORTANT: Never emit native tool-call markup such as
 <|tool_calls_section_begin|>, <|tool_call_begin|>, <|tool_call_argument_begin|>
-or any other <|...|> tokens. Tool calls are ONLY valid in the textual
+or DSML markup such as <｜DSML｜tool_calls>, <｜DSML｜invoke>, and
+<｜DSML｜parameter>. Tool calls are ONLY valid in the textual
 Thought/Action/Action Input format shown above.
 """.strip()
 
@@ -2882,11 +3063,28 @@ Action Input: The JSON format of tool parameters
 
 IMPORTANT: Never emit native tool-call markup such as
 <|tool_calls_section_begin|>, <|tool_call_begin|>, <|tool_call_argument_begin|>
-or any other <|...|> tokens. Tool calls are ONLY valid in the textual
+or DSML markup such as <｜DSML｜tool_calls>, <｜DSML｜invoke>, and
+<｜DSML｜parameter>. Tool calls are ONLY valid in the textual
 Thought/Action/Action Input format shown above.
 """.strip()
 
         workflow_prompt = workflow_prompt + "\n\n" + DISPATCH_PROMPT_SECTION
+
+        if knowledge_space or knowledge_resources:
+            workflow_prompt += """
+
+## Citation Rules
+When the final answer is based on retrieved knowledge sources:
+- Add square-bracket citation markers such as [1] immediately after the
+  statement supported by that source.
+- Use explicit source numbers when the retrieval result provides them. Otherwise,
+  number unique trusted knowledge sources by the order in which they first appear
+  across tool results, starting at [1].
+- Reuse the same number when citing the same source again.
+- Never invent citation numbers.
+- A statement may cite multiple sources, for example [1][2].
+- Do not cite general reasoning that is not supported by a retrieved source.
+"""
 
         if tool_mode == "knowledge":
             # Knowledge-chat mode (no pre-selected skill): only kb
@@ -3026,7 +3224,7 @@ Thought/Action/Action Input format shown above.
     )
 
     agent_builder = (
-        ToolCallingReActAgent(max_retry_count=30)
+        ToolCallingReActAgent(max_retry_count=5)
         .bind(context)
         .bind(agent_memory)
         .bind(llm_config)
@@ -3055,11 +3253,14 @@ Thought/Action/Action Input format shown above.
     )
 
     async def run_agent():
-        return await agent.generate_reply(
-            received_message=received,
-            sender=agent,
-            stream_callback=stream_callback,
-            historical_dialogues=historical_dialogues,
+        return await asyncio.wait_for(
+            agent.generate_reply(
+                received_message=received,
+                sender=agent,
+                stream_callback=stream_callback,
+                historical_dialogues=historical_dialogues,
+            ),
+            timeout=REACT_AGENT_TIMEOUT_SECONDS,
         )
 
     agent_task = asyncio.create_task(run_agent())
@@ -3551,7 +3752,11 @@ Thought/Action/Action Input format shown above.
     try:
         reply = await agent_task
     except Exception as e:
-        err_msg = f"React agent failed: {e}"
+        err_msg = (
+            f"React agent timed out after {REACT_AGENT_TIMEOUT_SECONDS} seconds"
+            if isinstance(e, asyncio.TimeoutError)
+            else f"React agent failed: {e}"
+        )
         fail_running_subagent_history(subagent_history)
         error_payload = _build_react_history_payload(
             final_content=err_msg,

@@ -1,6 +1,8 @@
 """Semantic search tool for knowledge spaces."""
 
+import json
 import logging
+import math
 from typing import Annotated
 
 from dbgpt.agent.resource.tool.base import tool
@@ -20,21 +22,50 @@ def _get_rag_service():
 
 
 def _format_chunk_results(chunks, query, knowledge_id):
+    from .citation_source import resolve_retrieved_chunk
+
     lines = [f"Semantic search '{query}' in {knowledge_id}:"]
+    citations = []
     chars = len(lines[0])
     for i, chunk in enumerate(chunks):
         content = chunk.content or ""
         score = getattr(chunk, "score", None)
+        try:
+            citation_score = float(score) if score is not None else None
+        except (TypeError, ValueError):
+            citation_score = None
+        if citation_score is not None and not math.isfinite(citation_score):
+            citation_score = None
         metadata = getattr(chunk, "metadata", {}) or {}
-        file_path = metadata.get("file_path", "")
-        score_str = f" (score: {score:.2f})" if score is not None else ""
+        source = resolve_retrieved_chunk(knowledge_id, chunk)
+        file_path = source.source_name if source else metadata.get("file_path", "")
+        score_str = (
+            f" (score: {citation_score:.2f})" if citation_score is not None else ""
+        )
         entry = f"\n---\n### Result {i + 1}{score_str} [{file_path}]\n{content}"
         chars += len(entry)
         if chars > 8000:
             lines.append(f"\n... {len(chunks) - i} more results.")
             break
         lines.append(entry)
-    return "\n".join(lines)
+        if source:
+            citations.append(
+                {
+                    "id": f"chunk-{source.chunk_id}",
+                    "chunkIndex": i + 1,
+                    "excerpt": source.content,
+                    "score": citation_score,
+                    **source.to_citation_dict(),
+                }
+            )
+    return json.dumps(
+        {
+            "chunks": [{"output_type": "markdown", "content": "\n".join(lines)}],
+            "citations": citations,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+    )
 
 
 @tool(

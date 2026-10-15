@@ -70,6 +70,35 @@ class MarkdownKnowledge(Knowledge):
 
         chunk_manager = ChunkManager(knowledge=self, chunk_parameter=chunk_parameter)
         chunks = chunk_manager.split(documents)
+        # Preserve a best-effort mapping back to the uploaded Markdown source.
+        # Header/size splitters normally keep source substrings intact; recording
+        # the line range here lets citation viewers navigate without re-searching
+        # the entire file. If a custom splitter rewrites text, leave the locator
+        # absent rather than persisting an incorrect position.
+        for source_document in documents:
+            source_text = source_document.content or ""
+            cursor = 0
+            for chunk in chunks:
+                if chunk.metadata.get("source") != source_document.metadata.get(
+                    "source"
+                ):
+                    continue
+                chunk_text = chunk.content or ""
+                if not chunk_text:
+                    continue
+                start = source_text.find(chunk_text, cursor)
+                if start < 0:
+                    start = source_text.find(chunk_text)
+                if start < 0:
+                    continue
+                end = start + len(chunk_text)
+                chunk.metadata["start_line"] = source_text.count("\n", 0, start) + 1
+                chunk.metadata["end_line"] = (
+                    chunk.metadata["start_line"] + chunk_text.count("\n")
+                )
+                chunk.metadata["start_offset"] = start
+                chunk.metadata["end_offset"] = end
+                cursor = end
         for document in documents:
             document.chunks = chunks
         return documents

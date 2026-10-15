@@ -49,10 +49,20 @@ class AgentCitation:
     score: Optional[float] = None
     path: Optional[str] = None
     url: Optional[str] = None
+    knowledge_space_id: Optional[int] = None
+    document_id: Optional[int] = None
+    chunk_id: Optional[int] = None
+    source_type: Optional[str] = None
+    page_number: Optional[int] = None
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    sheet_name: Optional[str] = None
+    start_row: Optional[int] = None
+    end_row: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the citation using the version 2 wire field names."""
-        return {
+        payload = {
             "index": self.index,
             "id": self.id,
             "sourceName": self.source_name,
@@ -61,6 +71,22 @@ class AgentCitation:
             "path": self.path,
             "url": self.url,
         }
+        optional_fields = {
+            "knowledgeSpaceId": self.knowledge_space_id,
+            "documentId": self.document_id,
+            "chunkId": self.chunk_id,
+            "sourceType": self.source_type,
+            "pageNumber": self.page_number,
+            "startLine": self.start_line,
+            "endLine": self.end_line,
+            "sheetName": self.sheet_name,
+            "startRow": self.start_row,
+            "endRow": self.end_row,
+        }
+        payload.update(
+            {key: value for key, value in optional_fields.items() if value is not None}
+        )
+        return payload
 
 
 @dataclass(frozen=True)
@@ -94,6 +120,17 @@ class _CitationDraft:
     score: Optional[float] = None
     path: Optional[str] = None
     url: Optional[str] = None
+    knowledge_space_id: Optional[int] = None
+    document_id: Optional[int] = None
+    chunk_id: Optional[int] = None
+    source_type: Optional[str] = None
+    page_number: Optional[int] = None
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    sheet_name: Optional[str] = None
+    start_row: Optional[int] = None
+    end_row: Optional[int] = None
+    citation_index: Optional[int] = None
 
 
 def strip_legacy_references(content: Any) -> str:
@@ -154,21 +191,42 @@ class FinalAnswerAssembler:
 
     def finalize(self, content: Any) -> AgentFinalAnswer:
         """Build a final answer whose content never contains legacy metadata."""
-        citations = tuple(
-            AgentCitation(
-                index=index,
-                id=draft.citation_id or _stable_citation_id(draft),
-                source_name=draft.source_name,
-                excerpt=draft.excerpt,
-                score=draft.score,
-                path=draft.path,
-                url=draft.url,
+        citations: List[AgentCitation] = []
+        used_indexes: set[int] = set()
+        next_index = 1
+        for draft in self._drafts:
+            requested_index = _positive_int(draft.citation_index)
+            if requested_index is not None and requested_index not in used_indexes:
+                index = requested_index
+            else:
+                while next_index in used_indexes:
+                    next_index += 1
+                index = next_index
+            used_indexes.add(index)
+            citations.append(
+                AgentCitation(
+                    index=index,
+                    id=draft.citation_id or _stable_citation_id(draft),
+                    source_name=draft.source_name,
+                    excerpt=draft.excerpt,
+                    score=draft.score,
+                    path=draft.path,
+                    url=draft.url,
+                    knowledge_space_id=draft.knowledge_space_id,
+                    document_id=draft.document_id,
+                    chunk_id=draft.chunk_id,
+                    source_type=draft.source_type,
+                    page_number=draft.page_number,
+                    start_line=draft.start_line,
+                    end_line=draft.end_line,
+                    sheet_name=draft.sheet_name,
+                    start_row=draft.start_row,
+                    end_row=draft.end_row,
+                )
             )
-            for index, draft in enumerate(self._drafts, start=1)
-        )
         return AgentFinalAnswer(
             content=strip_legacy_references(content),
-            citations=citations,
+            citations=tuple(citations),
         )
 
     def _append(self, draft: _CitationDraft) -> None:
@@ -202,6 +260,22 @@ class FinalAnswerAssembler:
                 score=_coerce_score(draft.score),
                 path=path,
                 url=url,
+                knowledge_space_id=_positive_int(draft.knowledge_space_id),
+                document_id=_positive_int(draft.document_id),
+                chunk_id=_positive_int(draft.chunk_id),
+                source_type=(
+                    draft.source_type
+                    if draft.source_type
+                    in {"pdf", "markdown", "text", "csv", "spreadsheet"}
+                    else None
+                ),
+                page_number=_positive_int(draft.page_number),
+                start_line=_positive_int(draft.start_line),
+                end_line=_positive_int(draft.end_line),
+                sheet_name=_clean_metadata(draft.sheet_name, 256) or None,
+                start_row=_positive_int(draft.start_row),
+                end_row=_positive_int(draft.end_row),
+                citation_index=_positive_int(draft.citation_index),
             )
         )
         self._total_excerpt_chars += len(excerpt)
@@ -332,6 +406,19 @@ def _adapt_explicit_citations(
                 score=item.get("score", item.get("recall_score")),
                 path=str(path) if path else None,
                 url=str(raw_url) if raw_url else None,
+                knowledge_space_id=item.get(
+                    "knowledgeSpaceId", item.get("knowledge_space_id")
+                ),
+                document_id=item.get("documentId", item.get("document_id")),
+                chunk_id=item.get("chunkId", item.get("chunk_id")),
+                source_type=item.get("sourceType", item.get("source_type")),
+                page_number=item.get("pageNumber", item.get("page_number")),
+                start_line=item.get("startLine", item.get("start_line")),
+                end_line=item.get("endLine", item.get("end_line")),
+                sheet_name=item.get("sheetName", item.get("sheet_name")),
+                start_row=item.get("startRow", item.get("start_row", item.get("row"))),
+                end_row=item.get("endRow", item.get("end_row", item.get("row"))),
+                citation_index=item.get("index"),
             )
         )
     return drafts
@@ -340,6 +427,13 @@ def _adapt_explicit_citations(
 def _adapt_kb_cat(
     action_input: Dict[str, Any], observation: Any
 ) -> List[_CitationDraft]:
+    if isinstance(observation, str):
+        try:
+            parsed = json.loads(observation)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("citations"), list):
+            return _adapt_explicit_citations(parsed["citations"])
     path = action_input.get("path")
     if (
         not isinstance(path, str)
@@ -362,6 +456,13 @@ def _adapt_kb_cat(
 def _adapt_kb_grep(
     action_input: Dict[str, Any], observation: Any
 ) -> List[_CitationDraft]:
+    if isinstance(observation, str):
+        try:
+            parsed = json.loads(observation)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("citations"), list):
+            return _adapt_explicit_citations(parsed["citations"])
     query = action_input.get("query")
     if (
         not isinstance(query, str)
@@ -409,6 +510,12 @@ def _adapt_semantic_search(
     ):
         return []
     text = observation.strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("citations"), list):
+        return _adapt_explicit_citations(parsed["citations"])
     lowered = text.casefold()
     failure_prefixes = (
         "semantic search service unavailable",
@@ -494,6 +601,14 @@ def _coerce_score(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return score if math.isfinite(score) else None
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 else None
 
 
 def _stable_citation_id(draft: _CitationDraft) -> str:

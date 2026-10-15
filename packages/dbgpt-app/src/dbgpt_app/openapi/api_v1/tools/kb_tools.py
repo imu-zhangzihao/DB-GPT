@@ -4,9 +4,94 @@ These wrap the generic kb_ls, kb_glob, kb_grep, kb_cat, and kb_semantic_search
 tools so that `knowledge_id` is pre-bound and the LLM does not need to provide it.
 """
 
-from typing import List
+import json
+import re
+from typing import Dict, List, Tuple
 
 from dbgpt.agent.resource.tool.base import tool
+
+
+def _apply_semantic_citation_registry(
+    result: str, citation_registry: Dict[Tuple[int, int, int], int]
+) -> str:
+    """Assign request-global numbers to a structured semantic-search result."""
+    try:
+        payload = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return result
+    citations = payload.get("citations")
+    chunks = payload.get("chunks")
+    if not isinstance(citations, list):
+        return result
+    index_map: Dict[int, int] = {}
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        try:
+            key = (
+                int(citation["knowledgeSpaceId"]),
+                int(citation["documentId"]),
+                int(citation["chunkId"]),
+            )
+            local_index = int(citation.get("chunkIndex") or len(index_map) + 1)
+        except (KeyError, TypeError, ValueError):
+            continue
+        global_index = citation_registry.setdefault(key, len(citation_registry) + 1)
+        citation["index"] = global_index
+        index_map[local_index] = global_index
+    for chunk in chunks if isinstance(chunks, list) else []:
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("content"), str):
+            continue
+        chunk["content"] = re.sub(
+            r"(?m)^(###\s+Result\s+)(\d+)",
+            lambda match: match.group(1)
+            + str(index_map.get(int(match.group(2)), int(match.group(2)))),
+            chunk["content"],
+        )
+    return json.dumps(payload, ensure_ascii=False, allow_nan=False)
+
+
+def _normalize_visible_text(value: str) -> str:
+    return re.sub(r"\s+", "", value).casefold()
+
+
+def _attach_file_citations(
+    result: str,
+    sources,
+    citation_registry: Dict[Tuple[int, int, int], int],
+) -> str:
+    """Attach only persisted chunks that are actually visible in tool output."""
+    normalized_result = _normalize_visible_text(result)
+    citations = []
+    for source in sources:
+        excerpt = re.sub(
+            r"^\[文件: [^\]]*\](?:\s*\[路径: [^\]]*\])?\s*\n?",
+            "",
+            source.content or "",
+        ).strip()
+        probe = _normalize_visible_text(excerpt)[:80]
+        if not excerpt or (probe and probe not in normalized_result):
+            continue
+        citation = source.to_citation_dict()
+        citation.update(
+            {
+                "id": f"chunk-{source.chunk_id}",
+                "excerpt": excerpt,
+            }
+        )
+        citations.append(citation)
+    if not citations:
+        return result
+    payload = {
+        "content": result,
+        "citationInstruction": (
+            "When using a passage, cite its citations[].index in square brackets."
+        ),
+        "citations": citations,
+    }
+    return _apply_semantic_citation_registry(
+        json.dumps(payload, ensure_ascii=False), citation_registry
+    )
 
 
 def make_kb_ls(knowledge_id: str):
@@ -49,7 +134,10 @@ def make_kb_glob(knowledge_id: str):
     return _kb_glob
 
 
-def make_kb_grep(knowledge_id: str):
+def make_kb_grep(
+    knowledge_id: str,
+    citation_registry: Dict[Tuple[int, int, int], int] | None = None,
+):
     """Create a kb_grep tool bound to a specific knowledge space."""
 
     @tool(
@@ -70,17 +158,31 @@ def make_kb_grep(knowledge_id: str):
     ) -> str:
         from dbgpt_serve.rag.tools.kb_file_tools import kb_grep as _impl
 
-        return await _impl(
+        result = await _impl(
             knowledge_id=knowledge_id,
             query=query,
             path=path,
             file_pattern=file_pattern,
         )
+        if citation_registry is None:
+            return result
+        from dbgpt_serve.rag.tools.citation_source import resolve_file_tool_chunks
+
+        sources = resolve_file_tool_chunks(
+            knowledge_id,
+            path=path,
+            query=query,
+            file_pattern=file_pattern,
+        )
+        return _attach_file_citations(result, sources, citation_registry)
 
     return _kb_grep
 
 
-def make_kb_cat(knowledge_id: str):
+def make_kb_cat(
+    knowledge_id: str,
+    citation_registry: Dict[Tuple[int, int, int], int] | None = None,
+):
     """Create a kb_cat tool bound to a specific knowledge space."""
 
     @tool(
@@ -88,6 +190,8 @@ def make_kb_cat(knowledge_id: str):
         description=(
             "Read the content of a specific file in the knowledge base. "
             "Use this after kb_ls or kb_glob to read a file you found. "
+            "For long documents and PDFs, first use grep/semantic_search and "
+            "read only a targeted line range; do not read the whole file. "
             'Parameters: {{"path": "file path like src/main.py", '
             '"start_line": "start line number (optional, default 1)", '
             '"end_line": "end line number (optional, 0 = to end)"}}'
@@ -100,17 +204,31 @@ def make_kb_cat(knowledge_id: str):
     ) -> str:
         from dbgpt_serve.rag.tools.kb_file_tools import kb_cat as _impl
 
-        return await _impl(
+        result = await _impl(
             knowledge_id=knowledge_id,
             path=path,
             start_line=start_line,
             end_line=end_line,
         )
+        if citation_registry is None:
+            return result
+        from dbgpt_serve.rag.tools.citation_source import resolve_file_tool_chunks
+
+        sources = resolve_file_tool_chunks(
+            knowledge_id,
+            path=path,
+            start_line=start_line,
+            end_line=end_line,
+        )
+        return _attach_file_citations(result, sources, citation_registry)
 
     return _kb_cat
 
 
-def make_kb_semantic_search(knowledge_id: str):
+def make_kb_semantic_search(
+    knowledge_id: str,
+    citation_registry: Dict[Tuple[int, int, int], int] | None = None,
+):
     """Create a semantic_search tool bound to a specific knowledge space."""
 
     @tool(
@@ -133,11 +251,14 @@ def make_kb_semantic_search(knowledge_id: str):
             kb_semantic_search as _impl,
         )
 
-        return await _impl(
+        result = await _impl(
             knowledge_id=knowledge_id,
             query=query,
             top_k=top_k,
         )
+        if citation_registry is None:
+            return result
+        return _apply_semantic_citation_registry(result, citation_registry)
 
     return _semantic_search
 
@@ -306,12 +427,13 @@ def make_kb_tools(knowledge_id: str) -> List:
     Note: codegraph tools are always returned; callers are responsible for
     filtering them out when the knowledge space has no built code graph.
     """
+    citation_registry: Dict[Tuple[int, int, int], int] = {}
     return [
         make_kb_ls(knowledge_id),
         make_kb_glob(knowledge_id),
-        make_kb_grep(knowledge_id),
-        make_kb_cat(knowledge_id),
-        make_kb_semantic_search(knowledge_id),
+        make_kb_grep(knowledge_id, citation_registry),
+        make_kb_cat(knowledge_id, citation_registry),
+        make_kb_semantic_search(knowledge_id, citation_registry),
         *_make_kb_wiki_tools(knowledge_id),
         make_kb_codegraph_explore(knowledge_id),
         make_kb_codegraph_call_chain(knowledge_id),
